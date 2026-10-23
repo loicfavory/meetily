@@ -132,6 +132,35 @@ pub fn default_sink_name() -> Result<Option<String>> {
     pulse_enumerator::default_sink_name()
 }
 
+/// Why `PulseCapture::run` returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureStop {
+    /// The stop handle was signalled.
+    Requested,
+    /// The record stream failed while no stop had been requested.
+    ReadError(String),
+}
+
+impl CaptureStop {
+    /// The user-facing failure message, or `None` for a requested stop.
+    pub fn failure_message(&self) -> Option<&str> {
+        match self {
+            CaptureStop::Requested => None,
+            CaptureStop::ReadError(message) => Some(message),
+        }
+    }
+}
+
+/// Classify a failed read: if a stop was requested in the meantime the error is
+/// just the teardown racing the blocking read, not a capture failure.
+fn classify_read_error(stop_requested: bool, error: &str) -> CaptureStop {
+    if stop_requested {
+        CaptureStop::Requested
+    } else {
+        CaptureStop::ReadError(format!("PulseAudio record stream read error: {}", error))
+    }
+}
+
 /// Blocking PulseAudio record stream, backed by libpulse-simple's record API.
 /// Used both for sink monitors (system audio) and real input sources
 /// (microphones).
@@ -203,8 +232,8 @@ impl PulseCapture {
     /// Runs a blocking read loop, invoking `on_samples` with interleaved f32
     /// frames as they arrive. Meant to run on a `spawn_blocking` task, since
     /// PulseAudio's simple API blocks on `read()`. Returns once `stop_handle()`
-    /// is signalled or the stream errors out.
-    pub fn run(&self, mut on_samples: impl FnMut(&[f32])) {
+    /// is signalled or the stream errors out; the return value tells which.
+    pub fn run(&self, mut on_samples: impl FnMut(&[f32])) -> CaptureStop {
         // ~21ms at 48kHz stereo: matches the 1024-frame chunking used by the
         // macOS Core Audio path.
         const FRAMES_PER_CHUNK: usize = 1024;
@@ -213,8 +242,14 @@ impl PulseCapture {
 
         while !self.should_stop.load(Ordering::Acquire) {
             if let Err(e) = self.simple.read(&mut byte_buf) {
-                warn!("PulseAudio record stream read error: {}", e);
-                break;
+                let stop = classify_read_error(
+                    self.should_stop.load(Ordering::Acquire),
+                    &format!("{}", e),
+                );
+                if let CaptureStop::ReadError(message) = &stop {
+                    warn!("{}", message);
+                }
+                return stop;
             }
 
             // Re-check right after the blocking read returns: if stop() timed
@@ -222,7 +257,7 @@ impl PulseCapture {
             // late read() shouldn't inject one more chunk into whatever
             // pipeline state now exists (new stream, new recording).
             if self.should_stop.load(Ordering::Acquire) {
-                break;
+                return CaptureStop::Requested;
             }
 
             sample_buf.clear();
@@ -234,6 +269,7 @@ impl PulseCapture {
 
             on_samples(&sample_buf);
         }
+        CaptureStop::Requested
     }
 }
 
@@ -280,12 +316,13 @@ mod tests {
         let received_clone = received.clone();
         let stop_clone = stop.clone();
         let handle = std::thread::spawn(move || {
-            capture.run(|samples| {
+            let stop = capture.run(|samples| {
                 received_clone.fetch_add(samples.len(), std::sync::atomic::Ordering::Relaxed);
                 if received_clone.load(std::sync::atomic::Ordering::Relaxed) > 48000 * 2 {
                     stop_clone.store(true, std::sync::atomic::Ordering::Release);
                 }
             });
+            assert_eq!(stop, CaptureStop::Requested);
         });
 
         std::thread::sleep(std::time::Duration::from_secs(3));
@@ -295,6 +332,21 @@ mod tests {
         let total = received.load(std::sync::atomic::Ordering::Relaxed);
         println!("Received {} samples", total);
         assert!(total > 0, "Expected to receive some samples from the monitor source");
+    }
+
+    #[test]
+    fn read_error_without_stop_is_a_failure() {
+        let stop = classify_read_error(false, "Connection terminated");
+        assert!(matches!(stop, CaptureStop::ReadError(_)));
+        let message = stop.failure_message().expect("failure message");
+        assert!(message.contains("Connection terminated"));
+    }
+
+    #[test]
+    fn read_error_after_stop_request_is_not_a_failure() {
+        let stop = classify_read_error(true, "Connection terminated");
+        assert_eq!(stop, CaptureStop::Requested);
+        assert!(stop.failure_message().is_none());
     }
 
     fn sink(name: &str, description: &str) -> PulseSink {

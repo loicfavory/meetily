@@ -504,6 +504,14 @@ impl RecordingManager {
         self.state.set_error_callback(callback);
     }
 
+    /// Set the callback invoked when a capture track fails for good
+    pub fn set_capture_failure_callback<F>(&self, callback: F)
+    where
+        F: Fn(&super::recording_state::CaptureFailure) + Send + Sync + 'static,
+    {
+        self.state.set_capture_failure_callback(callback);
+    }
+
     /// Check if there's a fatal error
     pub fn has_fatal_error(&self) -> bool {
         self.state.has_fatal_error()

@@ -14,7 +14,7 @@ use super::capture::{AudioCaptureBackend, get_current_backend};
 use super::capture::CoreAudioCapture;
 
 #[cfg(target_os = "linux")]
-use super::capture::{find_sink_by_name, find_source_by_name, list_pulse_sources, PulseCapture};
+use super::capture::{find_sink_by_name, find_source_by_name, list_pulse_sources, CaptureStop, PulseCapture};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicBool;
 
@@ -278,6 +278,30 @@ impl AudioStream {
         })
     }
 
+    /// Run a Pulse capture on a blocking thread and escalate a terminal read
+    /// failure to the recording state instead of ending silently.
+    #[cfg(target_os = "linux")]
+    fn spawn_pulse_worker(
+        capture_impl: PulseCapture,
+        capture: AudioCapture,
+        state: Arc<RecordingState>,
+        device_type: DeviceType,
+        device_name: String,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::task::spawn_blocking(move || {
+            info!("✅ Stream: PulseAudio capture thread started for {}", device_name);
+            let stop = capture_impl.run(|samples| capture.process_audio_data(samples));
+            if let CaptureStop::ReadError(message) = &stop {
+                error!(
+                    "❌ Stream: PulseAudio capture for {} failed: {}",
+                    device_name, message
+                );
+                state.report_capture_failure(device_type, message.clone());
+            }
+            info!("⚠️ Stream: PulseAudio capture thread ended for {}", device_name);
+        })
+    }
+
     /// Create a native PulseAudio/PipeWire stream (Linux only)
     #[cfg(target_os = "linux")]
     async fn create_pulse_stream(
@@ -303,16 +327,17 @@ impl AudioStream {
             state.clone(),
             sample_rate,
             channels,
-            device_type,
+            device_type.clone(),
             recording_sender,
         );
 
-        let device_name = device.name.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            info!("✅ Stream: PulseAudio capture thread started for {}", device_name);
-            capture_impl.run(|samples| capture.process_audio_data(samples));
-            info!("⚠️ Stream: PulseAudio capture thread ended for {}", device_name);
-        });
+        let task = Self::spawn_pulse_worker(
+            capture_impl,
+            capture,
+            state,
+            device_type,
+            device.name.clone(),
+        );
 
         info!("✅ Stream: PulseAudio stream fully initialized for device: {}", device.name);
 
@@ -353,22 +378,17 @@ impl AudioStream {
             state.clone(),
             sample_rate,
             channels,
-            device_type,
+            device_type.clone(),
             recording_sender,
         );
 
-        let device_name = device.name.clone();
-        let task = tokio::task::spawn_blocking(move || {
-            info!(
-                "✅ Stream: PulseAudio microphone capture thread started for {}",
-                device_name
-            );
-            capture_impl.run(|samples| capture.process_audio_data(samples));
-            info!(
-                "⚠️ Stream: PulseAudio microphone capture thread ended for {}",
-                device_name
-            );
-        });
+        let task = Self::spawn_pulse_worker(
+            capture_impl,
+            capture,
+            state,
+            device_type,
+            device.name.clone(),
+        );
 
         info!(
             "✅ Stream: PulseAudio microphone stream fully initialized for device: {}",

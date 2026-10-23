@@ -25,7 +25,7 @@ pub use core_audio::{CoreAudioCapture, CoreAudioStream};
 
 #[cfg(target_os = "linux")]
 pub use pulse_linux::{
-    PulseCapture, PulseSink, PulseSource,
+    CaptureStop, PulseCapture, PulseSink, PulseSource,
     default_sink as default_pulse_sink, default_sink_name as default_pulse_sink_name,
     default_source_name as default_pulse_source_name, find_sink_by_name, find_source_by_name,
     list_sinks as list_pulse_sinks, list_sources as list_pulse_sources,

@@ -33,6 +33,26 @@ pub struct ProcessedAudioChunk {
     pub device_type: DeviceType,
 }
 
+impl DeviceType {
+    /// Stable role name used in events sent to the frontend.
+    pub fn role(&self) -> &'static str {
+        match self {
+            DeviceType::Microphone => "microphone",
+            DeviceType::System => "system",
+        }
+    }
+}
+
+/// A capture track that stopped delivering audio for good.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureFailure {
+    pub role: DeviceType,
+    pub message: String,
+    /// True when the other track is still capturing, so the session goes on in
+    /// a degraded state rather than recording nothing.
+    pub recording_continues: bool,
+}
+
 /// Comprehensive error types for audio system
 #[derive(Debug, Clone)]
 pub enum AudioError {
@@ -112,6 +132,8 @@ pub struct RecordingState {
     recoverable_error_count: AtomicU32,
     last_error: Mutex<Option<AudioError>>,
     error_callback: Mutex<Option<Box<dyn Fn(&AudioError) + Send + Sync>>>,
+    capture_failures: Mutex<Vec<(DeviceType, String)>>,
+    capture_failure_callback: Mutex<Option<Box<dyn Fn(&CaptureFailure) + Send + Sync>>>,
 
     // Statistics
     stats: Mutex<RecordingStats>,
@@ -136,6 +158,8 @@ impl RecordingState {
             recoverable_error_count: AtomicU32::new(0),
             last_error: Mutex::new(None),
             error_callback: Mutex::new(None),
+            capture_failures: Mutex::new(Vec::new()),
+            capture_failure_callback: Mutex::new(None),
             stats: Mutex::new(RecordingStats::default()),
             recording_start: Mutex::new(None),
             pause_start: Mutex::new(None),
@@ -150,6 +174,7 @@ impl RecordingState {
         self.error_count.store(0, Ordering::SeqCst);
         self.recoverable_error_count.store(0, Ordering::SeqCst);
         *self.last_error.lock().unwrap() = None;
+        self.capture_failures.lock().unwrap().clear();
         Ok(())
     }
 
@@ -296,6 +321,74 @@ impl RecordingState {
         }
     }
 
+    pub fn set_capture_failure_callback<F>(&self, callback: F)
+    where
+        F: Fn(&CaptureFailure) + Send + Sync + 'static,
+    {
+        *self.capture_failure_callback.lock().unwrap() = Some(Box::new(callback));
+    }
+
+    /// Record a terminal capture failure of one track and notify the callback.
+    /// Returns `None` (and records nothing) when the session is no longer
+    /// recording, so a worker unwinding after Stop never raises a failure.
+    pub fn report_capture_failure(
+        &self,
+        role: DeviceType,
+        message: String,
+    ) -> Option<CaptureFailure> {
+        if !self.is_recording() {
+            return None;
+        }
+
+        let other_role = match role {
+            DeviceType::Microphone => DeviceType::System,
+            DeviceType::System => DeviceType::Microphone,
+        };
+        let other_device_set = match other_role {
+            DeviceType::Microphone => self.microphone_device.lock().unwrap().is_some(),
+            DeviceType::System => self.system_device.lock().unwrap().is_some(),
+        };
+
+        let recording_continues = {
+            let mut failures = self.capture_failures.lock().unwrap();
+            failures.retain(|(failed_role, _)| *failed_role != role);
+            failures.push((role.clone(), message.clone()));
+            other_device_set && !failures.iter().any(|(failed_role, _)| *failed_role == other_role)
+        };
+
+        let failure = CaptureFailure {
+            role,
+            message,
+            recording_continues,
+        };
+        log::error!(
+            "Capture failure on {} track: {} (recording continues: {})",
+            failure.role.role(),
+            failure.message,
+            failure.recording_continues
+        );
+        if let Some(callback) = self.capture_failure_callback.lock().unwrap().as_ref() {
+            callback(&failure);
+        }
+        Some(failure)
+    }
+
+    /// Forget a track failure once that track has been replaced by a working one.
+    pub fn clear_capture_failure(&self, role: DeviceType) {
+        self.capture_failures
+            .lock()
+            .unwrap()
+            .retain(|(failed_role, _)| *failed_role != role);
+    }
+
+    pub fn has_capture_failure(&self, role: DeviceType) -> bool {
+        self.capture_failures
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(failed_role, _)| *failed_role == role)
+    }
+
     pub fn get_error_count(&self) -> u32 {
         self.error_count.load(Ordering::SeqCst)
     }
@@ -373,6 +466,8 @@ impl RecordingState {
         *self.audio_sender.lock().unwrap() = None;
         *self.last_error.lock().unwrap() = None;
         *self.error_callback.lock().unwrap() = None;
+        *self.capture_failure_callback.lock().unwrap() = None;
+        self.capture_failures.lock().unwrap().clear();
         *self.stats.lock().unwrap() = RecordingStats::default();
         *self.recording_start.lock().unwrap() = None;
         *self.pause_start.lock().unwrap() = None;
@@ -398,6 +493,8 @@ impl Default for RecordingState {
             recoverable_error_count: AtomicU32::new(0),
             last_error: Mutex::new(None),
             error_callback: Mutex::new(None),
+            capture_failures: Mutex::new(Vec::new()),
+            capture_failure_callback: Mutex::new(None),
             stats: Mutex::new(RecordingStats::default()),
             recording_start: Mutex::new(None),
             pause_start: Mutex::new(None),
@@ -414,5 +511,92 @@ impl Clone for RecordingStats {
             total_duration: self.total_duration,
             last_activity: self.last_activity,
         }
+    }
+}
+#[cfg(test)]
+mod capture_failure_tests {
+    use super::*;
+
+    fn recording_state_with_both_tracks() -> Arc<RecordingState> {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        state.set_microphone_device(Arc::new(AudioDevice::new(
+            "mic".to_string(),
+            crate::audio::devices::DeviceType::Input,
+        )));
+        state.set_system_device(Arc::new(AudioDevice::new(
+            "sink".to_string(),
+            crate::audio::devices::DeviceType::Output,
+        )));
+        state
+    }
+
+    #[test]
+    fn system_failure_is_reported_while_mic_still_works() {
+        let state = recording_state_with_both_tracks();
+        let failure = state
+            .report_capture_failure(DeviceType::System, "read error".to_string())
+            .expect("reported");
+        assert_eq!(failure.role, DeviceType::System);
+        assert!(failure.recording_continues);
+        assert!(state.has_capture_failure(DeviceType::System));
+        assert!(!state.has_capture_failure(DeviceType::Microphone));
+    }
+
+    #[test]
+    fn second_track_failure_means_nothing_is_recorded() {
+        let state = recording_state_with_both_tracks();
+        state.report_capture_failure(DeviceType::System, "a".to_string());
+        let failure = state
+            .report_capture_failure(DeviceType::Microphone, "b".to_string())
+            .expect("reported");
+        assert!(!failure.recording_continues);
+    }
+
+    #[test]
+    fn single_track_session_failure_does_not_continue() {
+        let state = RecordingState::new();
+        state.start_recording().unwrap();
+        state.set_microphone_device(Arc::new(AudioDevice::new(
+            "mic".to_string(),
+            crate::audio::devices::DeviceType::Input,
+        )));
+        let failure = state
+            .report_capture_failure(DeviceType::Microphone, "x".to_string())
+            .expect("reported");
+        assert!(!failure.recording_continues);
+    }
+
+    #[test]
+    fn failure_after_stop_is_ignored() {
+        let state = recording_state_with_both_tracks();
+        state.stop_recording();
+        assert!(state
+            .report_capture_failure(DeviceType::Microphone, "late".to_string())
+            .is_none());
+        assert!(!state.has_capture_failure(DeviceType::Microphone));
+    }
+
+    #[test]
+    fn callback_receives_failure_and_clear_resets_track() {
+        let state = recording_state_with_both_tracks();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_callback = seen.clone();
+        state.set_capture_failure_callback(move |failure| {
+            seen_in_callback.lock().unwrap().push(failure.clone());
+        });
+        state.report_capture_failure(DeviceType::Microphone, "dead".to_string());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(seen.lock().unwrap()[0].message, "dead");
+        state.clear_capture_failure(DeviceType::Microphone);
+        assert!(!state.has_capture_failure(DeviceType::Microphone));
+    }
+
+    #[test]
+    fn restarting_a_session_clears_previous_failures() {
+        let state = recording_state_with_both_tracks();
+        state.report_capture_failure(DeviceType::System, "x".to_string());
+        state.start_recording().unwrap();
+        assert!(!state.has_capture_failure(DeviceType::System));
     }
 }

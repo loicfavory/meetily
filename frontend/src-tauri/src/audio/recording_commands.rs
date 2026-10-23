@@ -408,6 +408,17 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     manager.set_error_callback(move |error| {
         let _ = app_for_error.emit("recording-error", error.user_message());
     });
+    let app_for_capture_failure = app.clone();
+    manager.set_capture_failure_callback(move |failure| {
+        let _ = app_for_capture_failure.emit(
+            "audio-capture-failed",
+            serde_json::json!({
+                "role": failure.role.role(),
+                "message": failure.message,
+                "recording_continues": failure.recording_continues,
+            }),
+        );
+    });
 
     // Start recording with resolved devices (replaces start_recording_with_defaults_and_auto_save call)
     let transcription_receiver = manager
@@ -594,6 +605,17 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     let app_for_error = app.clone();
     manager.set_error_callback(move |error| {
         let _ = app_for_error.emit("recording-error", error.user_message());
+    });
+    let app_for_capture_failure = app.clone();
+    manager.set_capture_failure_callback(move |failure| {
+        let _ = app_for_capture_failure.emit(
+            "audio-capture-failed",
+            serde_json::json!({
+                "role": failure.role.role(),
+                "message": failure.message,
+                "recording_continues": failure.recording_continues,
+            }),
+        );
     });
 
     // Start recording with specified devices and auto_save setting
@@ -1409,6 +1431,7 @@ async fn do_mic_swap(device_name: &str, session: &Arc<super::RecordingState>) ->
             {
                 manager.set_mic_stream_after_swap(new_stream, device_arc, system_name);
                 info!("[HOT_SWAP] Mic hot-swap to '{}' completed", device_name);
+                session.clear_capture_failure(super::recording_state::DeviceType::Microphone);
                 None
             }
             Some(_) => Some((
