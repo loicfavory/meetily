@@ -47,6 +47,12 @@ function withStartTimeout<T>(promise: Promise<T>): Promise<T> {
  * Recording Service
  * Singleton service for managing recording lifecycle operations
  */
+export interface AudioCaptureFailedPayload {
+  role: 'microphone' | 'system';
+  message: string;
+  recording_continues: boolean;
+}
+
 export class RecordingService {
   /**
    * Check if recording is currently active
@@ -237,6 +243,18 @@ export class RecordingService {
    */
   async onMicRecoveryExhausted(callback: (payload: { device_name: string; device_label?: string }) => void): Promise<UnlistenFn> {
     return listen<{ device_name: string; device_label?: string }>('mic-recovery-exhausted', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for audio-capture-failed event (a capture track stopped delivering
+   * audio mid-recording)
+   * @param callback - Function to call with the failed track and a message
+   * @returns Promise that resolves to unlisten function
+   */
+  async onAudioCaptureFailed(callback: (payload: AudioCaptureFailedPayload) => void): Promise<UnlistenFn> {
+    return listen<AudioCaptureFailedPayload>('audio-capture-failed', (event) => {
       callback(event.payload);
     });
   }

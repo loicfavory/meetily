@@ -257,6 +257,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
     let unlistenFailed: (() => void) | undefined;
     let unlistenMicUnavailable: (() => void) | undefined;
     let unlistenExhausted: (() => void) | undefined;
+    let unlistenCaptureFailed: (() => void) | undefined;
 
     const setup = async () => {
       try {
@@ -316,6 +317,22 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
         });
         if (cancelled) { fnExhausted(); return; }
         unlistenExhausted = fnExhausted;
+
+        const fnCaptureFailed = await recordingService.onAudioCaptureFailed(({ role, message, recording_continues }) => {
+          console.error('[RecordingStateContext] audio-capture-failed →', role, message);
+          // Mid-recording only, like mic-swap-failed.
+          if (isRecordingRef.current) {
+            const track = role === 'system' ? 'System audio' : 'Microphone';
+            toast.error(
+              recording_continues
+                ? `${track} capture failed and is no longer being recorded — the rest of the recording continues. Stop and restart to fix. (${message})`
+                : `${track} capture failed and nothing is being recorded anymore. Stop and restart the recording. (${message})`,
+              { duration: 12000 }
+            );
+          }
+        });
+        if (cancelled) { fnCaptureFailed(); return; }
+        unlistenCaptureFailed = fnCaptureFailed;
       } catch (e) {
         console.error('[RecordingStateContext] Failed to set up hot-swap listeners:', e);
       }
@@ -328,6 +345,7 @@ export function RecordingStateProvider({ children }: { children: React.ReactNode
       unlistenSwitched?.();
       unlistenFailed?.();
       unlistenMicUnavailable?.();
+      unlistenCaptureFailed?.();
       unlistenExhausted?.();
     };
   }, []);
