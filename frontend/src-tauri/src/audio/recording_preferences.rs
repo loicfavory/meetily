@@ -1,4 +1,4 @@
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -17,6 +17,8 @@ const STORE_KEY: &str = "preferences";
 const SCHEMA_VERSION: u32 = 2;
 const V1_BACKUP_FILE: &str = "recording_preferences.v1.backup.json";
 const INVALID_BACKUP_FILE: &str = "recording_preferences.invalid.backup.json";
+const UNREADABLE_BACKUP_FILE: &str = "recording_preferences.unreadable.backup.json";
+const MAX_DEVICE_FIELD_LEN: usize = 1024;
 const GENERAL_KEYS: [&str; 4] = [
     "save_folder",
     "auto_save",
@@ -139,13 +141,17 @@ pub fn generate_recording_filename(format: &str) -> String {
     format!("recording_{}.{}", timestamp, format)
 }
 
-/// Version of a stored preferences object: no `schema_version` means v1.
-fn stored_version(raw: &Value) -> u32 {
-    raw.get("schema_version")
-        .and_then(Value::as_u64)
-        .filter(|v| *v >= 1)
-        .map(|v| v.min(u32::MAX as u64) as u32)
-        .unwrap_or(1)
+/// Version of a stored preferences object. Only a missing `schema_version`
+/// key means v1; a present key that is not a positive integer is invalid
+/// (`None`) and must never be migrated.
+fn stored_version(raw: &Value) -> Option<u32> {
+    match raw.get("schema_version") {
+        None => Some(1),
+        Some(value) => value
+            .as_u64()
+            .filter(|v| *v >= 1)
+            .map(|v| v.min(u32::MAX as u64) as u32),
+    }
 }
 
 fn role_keys(role: &str) -> (String, String, String) {
@@ -227,7 +233,16 @@ pub fn migrate_v1(raw: &Value, inventory: &MigrationInventory) -> MigrationOutco
     ];
     for (role, is_system, candidates) in roles {
         let (preferred_key, label_key, unresolved_key) = role_keys(role);
-        let value = object.get(&preferred_key).and_then(Value::as_str);
+        let value = match object.get(&preferred_key) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(text)) => Some(text.as_str()),
+            Some(other) => {
+                out.insert(preferred_key, Value::Null);
+                out.insert(label_key, Value::Null);
+                out.insert(unresolved_key, Value::String(other.to_string()));
+                continue;
+            }
+        };
         let (preferred, label, unresolved) = match (value, candidates) {
             (None, _) => (Value::Null, Value::Null, Value::Null),
             (Some(_), RoleCandidates::Unknown) => return MigrationOutcome::Deferred,
@@ -255,10 +270,14 @@ pub fn stamp_v1_as_v2(raw: &Value) -> Value {
     let mut out = raw.as_object().cloned().unwrap_or_default();
     for role in ["mic", "system"] {
         let (preferred_key, label_key, unresolved_key) = role_keys(role);
-        let preferred = out.get(&preferred_key).cloned().unwrap_or(Value::Null);
+        let (preferred, unresolved) = match out.get(&preferred_key) {
+            None | Some(Value::Null) => (Value::Null, Value::Null),
+            Some(Value::String(text)) => (Value::String(text.clone()), Value::Null),
+            Some(other) => (Value::Null, Value::String(other.to_string())),
+        };
         out.insert(preferred_key, preferred);
         out.insert(label_key, Value::Null);
-        out.insert(unresolved_key, Value::Null);
+        out.insert(unresolved_key, unresolved);
     }
     out.insert("schema_version".into(), json!(SCHEMA_VERSION));
     Value::Object(out)
@@ -270,19 +289,42 @@ fn deferred_view(raw: &Value) -> Value {
     let mut out = raw.as_object().cloned().unwrap_or_default();
     for role in ["mic", "system"] {
         let (preferred_key, label_key, unresolved_key) = role_keys(role);
-        let legacy = out.get(&preferred_key).and_then(Value::as_str).map(str::to_string);
+        let legacy = match out.get(&preferred_key) {
+            None | Some(Value::Null) => Value::Null,
+            Some(Value::String(text)) => Value::String(text.clone()),
+            Some(other) => Value::String(other.to_string()),
+        };
         out.insert(preferred_key, Value::Null);
         out.insert(label_key, Value::Null);
-        out.insert(unresolved_key, string_or_null(legacy.as_deref()));
+        out.insert(unresolved_key, legacy);
     }
     out.insert("schema_version".into(), json!(SCHEMA_VERSION));
     Value::Object(out)
 }
 
-fn migration_outcome(raw: &Value) -> MigrationOutcome {
+async fn migration_outcome(raw: &Value) -> MigrationOutcome {
     #[cfg(target_os = "linux")]
     {
-        let inventory = crate::audio::devices::platform::linux::migration_inventory();
+        let has_device_value = ["preferred_mic_device", "preferred_system_device"]
+            .iter()
+            .any(|key| !matches!(raw.get(*key), None | Some(Value::Null)));
+        let inventory = if has_device_value {
+            tokio::task::spawn_blocking(crate::audio::devices::platform::linux::migration_inventory)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Migration inventory task failed: {}", e);
+                    MigrationInventory {
+                        microphone: RoleCandidates::Unknown,
+                        system: RoleCandidates::Unknown,
+                    }
+                })
+        } else {
+            // Null roles never need the inventory: skip the Pulse calls.
+            MigrationInventory {
+                microphone: RoleCandidates::Unknown,
+                system: RoleCandidates::Unknown,
+            }
+        };
         migrate_v1(raw, &inventory)
     }
     #[cfg(not(target_os = "linux"))]
@@ -308,6 +350,17 @@ fn apply_device_choice(
     label: Option<&str>,
 ) -> Result<(), String> {
     let (preferred_key, label_key, unresolved_key) = role_keys(parse_role(role)?);
+    if let Some(id) = device_id {
+        if id.trim().is_empty() {
+            return Err("Device ID must not be empty".to_string());
+        }
+        if id.len() > MAX_DEVICE_FIELD_LEN {
+            return Err("Device ID is too long".to_string());
+        }
+    }
+    if label.is_some_and(|l| l.len() > MAX_DEVICE_FIELD_LEN) {
+        return Err("Device label is too long".to_string());
+    }
     let label = if device_id.is_some() { label } else { None };
     object.insert(preferred_key, string_or_null(device_id));
     object.insert(label_key, string_or_null(label));
@@ -338,28 +391,68 @@ pub enum BackupResult {
 /// Writes `{ "preferences": raw }` atomically and never overwrites an
 /// existing file: the first backup is the original.
 pub fn write_backup_if_absent(dir: &Path, file_name: &str, raw: &Value) -> Result<BackupResult> {
+    let body = serde_json::to_vec_pretty(&json!({ STORE_KEY: raw }))?;
+    write_bytes_backup_if_absent(dir, file_name, &body)
+}
+
+/// Durable, no-clobber write: temp file in the same directory, fsync, atomic
+/// link into place, then fsync of the directory. An existing empty file (an
+/// interrupted earlier write) counts as absent.
+fn write_bytes_backup_if_absent(dir: &Path, file_name: &str, bytes: &[u8]) -> Result<BackupResult> {
+    use std::io::Write;
+
     let target = dir.join(file_name);
-    if target.exists() {
-        return Ok(BackupResult::AlreadyPresent);
+    match std::fs::metadata(&target) {
+        Ok(meta) if meta.len() > 0 => return Ok(BackupResult::AlreadyPresent),
+        Ok(_) => std::fs::remove_file(&target)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     std::fs::create_dir_all(dir)?;
-    let temp = dir.join(format!("{}.tmp", file_name));
-    let body = serde_json::to_vec_pretty(&json!({ STORE_KEY: raw }))?;
-    std::fs::write(&temp, body)?;
-    if let Err(e) = std::fs::rename(&temp, &target) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(e.into());
+
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    temp.write_all(bytes)?;
+    temp.as_file().sync_all()?;
+    match temp.persist_noclobber(&target) {
+        Ok(_) => {}
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Ok(BackupResult::AlreadyPresent);
+        }
+        Err(e) => return Err(e.error.into()),
     }
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(BackupResult::Written)
 }
 
-fn backup_raw<R: Runtime>(app: &AppHandle<R>, file_name: &str, raw: &Value) -> Result<()> {
-    let dir = app
-        .path()
+fn app_data_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
+    app.path()
         .app_data_dir()
-        .map_err(|e| anyhow::anyhow!("Failed to resolve app data dir: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to resolve app data dir: {}", e))
+}
+
+fn backup_raw<R: Runtime>(app: &AppHandle<R>, file_name: &str, raw: &Value) -> Result<()> {
+    let dir = app_data_dir(app)?;
     if write_backup_if_absent(&dir, file_name, raw)? == BackupResult::Written {
         info!("Backed up stored recording preferences to {}", file_name);
+    }
+    Ok(())
+}
+
+/// The store returned nothing although its file exists and is not empty
+/// (unparseable JSON): keep the raw bytes before any write replaces them.
+fn backup_unreadable_store_file<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
+    let dir = app_data_dir(app)?;
+    let path = dir.join(STORE_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        _ => return Ok(()),
+    };
+    warn!("Stored recording preferences are unreadable; backing up the raw file");
+    if write_bytes_backup_if_absent(&dir, UNREADABLE_BACKUP_FILE, &bytes)?
+        == BackupResult::Written
+    {
+        info!("Backed up unreadable preferences file to {}", UNREADABLE_BACKUP_FILE);
     }
     Ok(())
 }
@@ -374,8 +467,8 @@ fn defaults_object() -> Map<String, Value> {
 /// Runs the v1 migration. Returns the v2 object and whether it is only an
 /// in-memory view (deferred, or the backup failed): in that case nothing may
 /// be written as a final v2 without a successful backup.
-fn upgrade_v1<R: Runtime>(app: &AppHandle<R>, raw: &Value) -> (Value, bool) {
-    match migration_outcome(raw) {
+async fn upgrade_v1<R: Runtime>(app: &AppHandle<R>, raw: &Value) -> (Value, bool) {
+    match migration_outcome(raw).await {
         MigrationOutcome::Migrated(migrated) => match backup_raw(app, V1_BACKUP_FILE, raw) {
             Ok(()) => (migrated, false),
             Err(e) => {
@@ -421,37 +514,45 @@ pub async fn load_recording_preferences<R: Runtime>(
             warn!("Stored preferences are not an object, using defaults");
             RecordingPreferences::default()
         }
-        Some(raw) => {
-            let version = stored_version(&raw);
-            let (view, pending) = if version == 1 {
-                let (view, pending) = upgrade_v1(app, &raw);
-                if !pending {
-                    store.set(STORE_KEY, view.clone());
-                    if let Err(e) = store.save() {
-                        warn!("Failed to persist migrated preferences: {}", e);
+        Some(raw) => match stored_version(&raw) {
+            None => {
+                warn!("Stored preferences have an invalid schema_version, using defaults");
+                if let Err(e) = backup_raw(app, INVALID_BACKUP_FILE, &raw) {
+                    warn!("Failed to back up invalid preferences: {}", e);
+                }
+                RecordingPreferences::default()
+            }
+            Some(version) => {
+                let (view, pending) = if version == 1 {
+                    let (view, pending) = upgrade_v1(app, &raw).await;
+                    if !pending {
+                        store.set(STORE_KEY, view.clone());
+                        if let Err(e) = store.save() {
+                            warn!("Failed to persist migrated preferences: {}", e);
+                        }
+                    }
+                    (view, pending)
+                } else {
+                    if version > SCHEMA_VERSION {
+                        warn!("Stored preferences use future schema version {}", version);
+                    }
+                    (raw, false)
+                };
+                match from_stored(view, pending) {
+                    Ok(prefs) => {
+                        info!("Loaded recording preferences from store");
+                        prefs
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize preferences: {}, using defaults", e);
+                        RecordingPreferences::default()
                     }
                 }
-                (view, pending)
-            } else {
-                if version > SCHEMA_VERSION {
-                    warn!("Stored preferences use future schema version {}", version);
-                }
-                (raw, false)
-            };
-            match from_stored(view, pending) {
-                Ok(prefs) => {
-                    info!("Loaded recording preferences from store");
-                    prefs
-                }
-                Err(e) => {
-                    warn!("Failed to deserialize preferences: {}, using defaults", e);
-                    RecordingPreferences::default()
-                }
             }
-        }
+        },
     };
 
-    info!("Loaded recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}",
+    debug!("Loaded recording preferences: save_folder={:?}, auto_save={}, format={}, mic={:?}, system={:?}",
           prefs.save_folder, prefs.auto_save, prefs.file_format,
           prefs.preferred_mic_device, prefs.preferred_system_device);
     Ok(prefs)
@@ -461,8 +562,11 @@ pub async fn load_recording_preferences<R: Runtime>(
 /// non-object or non-deserializable value is backed up first.
 fn writable_base<R: Runtime>(app: &AppHandle<R>, raw: Option<Value>) -> Result<Value> {
     match raw {
-        None => Ok(Value::Object(defaults_object())),
-        Some(value) if !value.is_object() => {
+        None => {
+            backup_unreadable_store_file(app)?;
+            Ok(Value::Object(defaults_object()))
+        }
+        Some(value) if !value.is_object() || stored_version(&value).is_none() => {
             backup_raw(app, INVALID_BACKUP_FILE, &value)?;
             Ok(Value::Object(defaults_object()))
         }
@@ -517,10 +621,10 @@ async fn save_general_preferences<R: Runtime>(
 /// Base object for a device choice: a v1 object is migrated first (a deferred
 /// migration still becomes v2, keeping legacy values as unresolved, but only
 /// once its backup is safely on disk).
-fn device_choice_base<R: Runtime>(app: &AppHandle<R>, raw: Option<Value>) -> Result<Value> {
+async fn device_choice_base<R: Runtime>(app: &AppHandle<R>, raw: Option<Value>) -> Result<Value> {
     match raw {
-        Some(value) if value.is_object() && stored_version(&value) == 1 => {
-            let (view, pending) = upgrade_v1(app, &value);
+        Some(value) if value.is_object() && stored_version(&value) == Some(1) => {
+            let (view, pending) = upgrade_v1(app, &value).await;
             if pending {
                 backup_raw(app, V1_BACKUP_FILE, &value)?;
             }
@@ -572,6 +676,7 @@ pub async fn set_preferred_audio_device<R: Runtime>(
         .map_err(|e| format!("Failed to access store: {}", e))?;
 
     let base = device_choice_base(&app, store.get(STORE_KEY))
+        .await
         .map_err(|e| format!("Failed to prepare recording preferences: {}", e))?;
     let mut object = base.as_object().cloned().unwrap_or_default();
     apply_device_choice(&mut object, &role, device_id.as_deref(), label.as_deref())?;
@@ -821,9 +926,76 @@ mod tests {
 
     #[test]
     fn version_detection() {
-        assert_eq!(stored_version(&json!({ "save_folder": "/x" })), 1);
-        assert_eq!(stored_version(&json!({ "schema_version": 2 })), 2);
-        assert_eq!(stored_version(&json!({ "schema_version": 3 })), 3);
+        assert_eq!(stored_version(&json!({ "save_folder": "/x" })), Some(1));
+        assert_eq!(stored_version(&json!({ "schema_version": 2 })), Some(2));
+        assert_eq!(stored_version(&json!({ "schema_version": 3 })), Some(3));
+    }
+
+    #[test]
+    fn present_but_non_integer_version_is_invalid() {
+        for bad in [json!("2"), json!(2.0), json!(0), json!(-1), json!(null), json!(true)] {
+            assert_eq!(stored_version(&json!({ "schema_version": bad })), None, "{}", bad);
+        }
+    }
+
+    #[test]
+    fn non_string_device_value_is_kept_as_unresolved() {
+        let raw = json!({ "preferred_mic_device": 42, "preferred_system_device": ["a"] });
+        let out = migrated(migrate_v1(&raw, &unknown_inventory()));
+        assert_eq!(out["preferred_mic_device"], Value::Null);
+        assert_eq!(out["unresolved_mic_device"], "42");
+        assert_eq!(out["unresolved_system_device"], "[\"a\"]");
+
+        let deferred = deferred_view(&raw);
+        assert_eq!(deferred["unresolved_mic_device"], "42");
+
+        let stamped = stamp_v1_as_v2(&raw);
+        assert_eq!(stamped["preferred_mic_device"], Value::Null);
+        assert_eq!(stamped["unresolved_mic_device"], "42");
+    }
+
+    #[test]
+    fn device_choice_rejects_empty_or_oversized_fields() {
+        let mut object = v2_object().as_object().cloned().unwrap();
+        assert!(apply_device_choice(&mut object, "system", Some(""), None).is_err());
+        assert!(apply_device_choice(&mut object, "system", Some("  \t"), None).is_err());
+        let long = "x".repeat(MAX_DEVICE_FIELD_LEN + 1);
+        assert!(apply_device_choice(&mut object, "system", Some(&long), None).is_err());
+        assert!(apply_device_choice(&mut object, "system", Some("sink"), Some(&long)).is_err());
+        let max = "x".repeat(MAX_DEVICE_FIELD_LEN);
+        assert!(apply_device_choice(&mut object, "system", Some(&max), Some(&max)).is_ok());
+        assert_eq!(object["preferred_mic_device"], "mic_a");
+    }
+
+    #[test]
+    fn empty_existing_backup_counts_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(V1_BACKUP_FILE), b"").unwrap();
+        let raw = v1(Some("Original"), None);
+        assert_eq!(
+            write_backup_if_absent(dir.path(), V1_BACKUP_FILE, &raw).unwrap(),
+            BackupResult::Written
+        );
+        let content: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(V1_BACKUP_FILE)).unwrap()).unwrap();
+        assert_eq!(content["preferences"]["preferred_mic_device"], "Original");
+    }
+
+    #[test]
+    fn raw_bytes_backup_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            write_bytes_backup_if_absent(dir.path(), UNREADABLE_BACKUP_FILE, b"{not json").unwrap(),
+            BackupResult::Written
+        );
+        assert_eq!(
+            write_bytes_backup_if_absent(dir.path(), UNREADABLE_BACKUP_FILE, b"other").unwrap(),
+            BackupResult::AlreadyPresent
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(UNREADABLE_BACKUP_FILE)).unwrap(),
+            b"{not json"
+        );
     }
 
     #[test]
@@ -990,7 +1162,7 @@ mod tests {
         let prefs = RecordingPreferences::default();
         let out = patch_general_fields(&v1(Some("Old mic"), None), &prefs);
         assert!(out.get("schema_version").is_none());
-        assert_eq!(stored_version(&out), 1);
+        assert_eq!(stored_version(&out), Some(1));
         assert_eq!(out["preferred_mic_device"], "Old mic");
     }
 
