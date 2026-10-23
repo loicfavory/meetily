@@ -18,6 +18,8 @@ export interface SelectedDevices {
   /** Legacy choice that could not be migrated to a device ID. */
   micUnresolved?: string | null;
   systemUnresolved?: string | null;
+  /** The v1 migration has not run yet: unresolved values are provisional. */
+  migrationPending?: boolean;
 }
 
 export type DeviceRole = 'microphone' | 'system';
@@ -50,6 +52,7 @@ export interface DevicePreferenceFields {
   preferred_system_label?: string | null;
   unresolved_mic_device?: string | null;
   unresolved_system_device?: string | null;
+  migration_pending?: boolean;
 }
 
 export function selectedDevicesFromPreferences(prefs: DevicePreferenceFields): SelectedDevices {
@@ -60,6 +63,7 @@ export function selectedDevicesFromPreferences(prefs: DevicePreferenceFields): S
     systemLabel: prefs.preferred_system_label ?? null,
     micUnresolved: prefs.unresolved_mic_device ?? null,
     systemUnresolved: prefs.unresolved_system_device ?? null,
+    migrationPending: prefs.migration_pending ?? false,
   };
 }
 
@@ -96,17 +100,9 @@ export function labelForId(devices: readonly AudioDevice[], id: string | null): 
   return match ? deviceLabel(match) : id;
 }
 
-export function isDeviceAvailable(
-  devices: readonly AudioDevice[],
-  type: AudioDevice['device_type'],
-  id: string,
-): boolean {
-  return devices.some((d) => d.device_type === type && d.name === id);
-}
-
 const GENERIC_ROLE_LABEL: Record<DeviceRole, string> = {
   microphone: 'Microphone',
-  system: 'Sortie audio',
+  system: 'System audio',
 };
 
 /**
@@ -120,7 +116,13 @@ export function selectionStatus(
 ): SelectionStatus {
   const isMic = role === 'microphone';
   const unresolved = isMic ? selected.micUnresolved : selected.systemUnresolved;
-  if (unresolved) return { kind: 'unresolved', legacy: unresolved };
+  if (unresolved) {
+    // While the migration is pending the legacy text is provisional: show it
+    // as unavailable rather than asking the user to re-select.
+    return selected.migrationPending
+      ? { kind: 'unknown', id: unresolved, label: unresolved, reason: 'loading' }
+      : { kind: 'unresolved', legacy: unresolved };
+  }
 
   const id = isMic ? selected.micDevice : selected.systemDevice;
   if (id === null) return { kind: 'default' };

@@ -48,6 +48,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
       try {
         const prefs = await invoke<RecordingPreferences>('get_recording_preferences');
         setPreferences(prefs);
+        setSelectedDevices(selectedDevicesFromPreferences(prefs));
       } catch (error) {
         console.error('Failed to load recording preferences:', error);
         // If loading fails, get default folder path

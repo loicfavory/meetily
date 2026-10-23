@@ -27,6 +27,7 @@ const isTranscriptionRuntimeStartError = (error: unknown) =>
  * text is never sent as a device ID.
  */
 function warnIfDevicesUnresolved(devices: SelectedDevices | undefined): void {
+  if (devices?.migrationPending) return;
   const roles: string[] = [];
   if (devices?.micUnresolved) roles.push('microphone');
   if (devices?.systemUnresolved) roles.push('system audio');

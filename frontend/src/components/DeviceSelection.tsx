@@ -105,7 +105,6 @@ function RoleNotice({ status, inventory }: { status: SelectionStatus; inventory:
 export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = false }: DeviceSelectionProps) {
   const [inventory, setInventory] = useState<AudioInventory | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [audioLevels, setAudioLevels] = useState<Map<string, AudioLevelData>>(new Map());
   const [isMonitoring, setIsMonitoring] = useState(false);
@@ -124,7 +123,6 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
   // marks both roles as failed: the saved selection is never touched here.
   const fetchDevices = async () => {
     try {
-      setError(null);
       const result = await fetchAudioInventory();
       setInventory(result);
       console.log('Fetched audio inventory:', result);
@@ -260,7 +258,7 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
       // Only monitor input devices for now (microphones)
       const deviceNames = inputDevices.map(device => device.name);
       if (deviceNames.length === 0) {
-        setError('No microphone devices found to monitor');
+        console.warn('No microphone devices found to monitor');
         return;
       }
 
@@ -270,7 +268,6 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
       console.log('Started audio level monitoring for input devices:', deviceNames);
     } catch (err) {
       console.error('Failed to start audio level monitoring:', err);
-      setError('Failed to start audio level monitoring');
     }
   };
 
@@ -334,12 +331,6 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
           </button>
         </div>
       </div>
-
-      {error && (
-        <div className="p-3 text-sm text-red-700 bg-red-50 border border-red-200 rounded-md">
-          {error}
-        </div>
-      )}
 
       <div className="space-y-3">
         {/* Microphone Selection */}
