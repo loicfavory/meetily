@@ -1398,22 +1398,33 @@ async fn do_mic_swap(device_name: &str, session: &Arc<super::RecordingState>) ->
     // must not block stop_recording (which needs RECORDING_MANAGER). (P1 #1)
     let system_name = default_output_device().ok().map(|d| d.name);
 
-    // Phase 3: Lock briefly — install ONLY if still the same session
-    {
+    // Phase 3: Lock briefly — install ONLY if still the same live session.
+    // A rejected stream is handed back out of the lock and stopped explicitly:
+    // dropping an AudioStream detaches its Pulse worker without signalling it.
+    let rejected = {
         let mut guard = RECORDING_MANAGER.lock().unwrap();
         match guard.as_mut() {
-            Some(manager) if Arc::ptr_eq(manager.get_state(), session) => {
+            Some(manager)
+                if Arc::ptr_eq(manager.get_state(), session) && manager.is_recording() =>
+            {
                 manager.set_mic_stream_after_swap(new_stream, device_arc, system_name);
                 info!("[HOT_SWAP] Mic hot-swap to '{}' completed", device_name);
+                None
             }
-            Some(_) => {
-                return Err("Session changed during hot-swap — discarding stale mic stream".to_string());
-            }
-            None => {
-                return Err("Recording manager gone during hot-swap".to_string());
-            }
+            Some(_) => Some((
+                new_stream,
+                "Session changed or stopped during hot-swap — discarding stale mic stream",
+            )),
+            None => Some((new_stream, "Recording manager gone during hot-swap")),
         }
-    } // lock released
+    }; // lock released
+
+    if let Some((stream, reason)) = rejected {
+        if let Err(e) = stream.stop().await {
+            warn!("[HOT_SWAP] Failed to stop discarded mic stream: {}", e);
+        }
+        return Err(reason.to_string());
+    }
 
     Ok(())
 }
