@@ -84,11 +84,17 @@ pub struct RoleInventory {
 
 impl RoleInventory {
     pub fn complete() -> Self {
-        Self { status: InventoryStatus::Complete, error: None }
+        Self {
+            status: InventoryStatus::Complete,
+            error: None,
+        }
     }
 
     pub fn with_error(status: InventoryStatus, error: String) -> Self {
-        Self { status, error: Some(error) }
+        Self {
+            status,
+            error: Some(error),
+        }
     }
 }
 

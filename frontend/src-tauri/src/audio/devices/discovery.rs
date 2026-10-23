@@ -16,7 +16,9 @@ pub struct AudioInventory {
 
 /// List all available audio devices on the system
 pub async fn list_audio_devices() -> Result<Vec<AudioDevice>> {
-    enumerate_inventory().await.map(|inventory| inventory.devices)
+    enumerate_inventory()
+        .await
+        .map(|inventory| inventory.devices)
 }
 
 /// Enumerate devices with per-role completeness. A failed enumeration is
@@ -92,7 +94,11 @@ async fn enumerate_inventory() -> Result<AudioInventory> {
         }
     }
 
-    Ok(AudioInventory { devices, microphone, system })
+    Ok(AudioInventory {
+        devices,
+        microphone,
+        system,
+    })
 }
 
 /// Trigger audio permission request on platforms that require it

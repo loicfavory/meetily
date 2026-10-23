@@ -449,10 +449,12 @@ fn backup_unreadable_store_file<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
         _ => return Ok(()),
     };
     warn!("Stored recording preferences are unreadable; backing up the raw file");
-    if write_bytes_backup_if_absent(&dir, UNREADABLE_BACKUP_FILE, &bytes)?
-        == BackupResult::Written
+    if write_bytes_backup_if_absent(&dir, UNREADABLE_BACKUP_FILE, &bytes)? == BackupResult::Written
     {
-        info!("Backed up unreadable preferences file to {}", UNREADABLE_BACKUP_FILE);
+        info!(
+            "Backed up unreadable preferences file to {}",
+            UNREADABLE_BACKUP_FILE
+        );
     }
     Ok(())
 }
@@ -879,7 +881,6 @@ pub async fn get_audio_backend_info() -> Result<Vec<BackendInfo>, String> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,8 +934,20 @@ mod tests {
 
     #[test]
     fn present_but_non_integer_version_is_invalid() {
-        for bad in [json!("2"), json!(2.0), json!(0), json!(-1), json!(null), json!(true)] {
-            assert_eq!(stored_version(&json!({ "schema_version": bad })), None, "{}", bad);
+        for bad in [
+            json!("2"),
+            json!(2.0),
+            json!(0),
+            json!(-1),
+            json!(null),
+            json!(true),
+        ] {
+            assert_eq!(
+                stored_version(&json!({ "schema_version": bad })),
+                None,
+                "{}",
+                bad
+            );
         }
     }
 
@@ -977,7 +990,8 @@ mod tests {
             BackupResult::Written
         );
         let content: Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join(V1_BACKUP_FILE)).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(dir.path().join(V1_BACKUP_FILE)).unwrap())
+                .unwrap();
         assert_eq!(content["preferences"]["preferred_mic_device"], "Original");
     }
 
@@ -1028,7 +1042,13 @@ mod tests {
 
     #[test]
     fn unique_mic_description_migrates_to_id_and_label() {
-        let inv = inventory(vec![candidate("mic_a", "USB Mic"), candidate("mic_b", "Built-in")], vec![]);
+        let inv = inventory(
+            vec![
+                candidate("mic_a", "USB Mic"),
+                candidate("mic_b", "Built-in"),
+            ],
+            vec![],
+        );
         let out = migrated(migrate_v1(&v1(Some("USB Mic"), None), &inv));
         assert_eq!(out["preferred_mic_device"], "mic_a");
         assert_eq!(out["preferred_mic_label"], "label:mic_a");
@@ -1073,7 +1093,10 @@ mod tests {
 
     #[test]
     fn value_matching_only_the_other_role_is_unresolved() {
-        let inv = inventory(vec![candidate("mic_a", "USB Mic")], vec![candidate("sink_a", "Headset")]);
+        let inv = inventory(
+            vec![candidate("mic_a", "USB Mic")],
+            vec![candidate("sink_a", "Headset")],
+        );
         let out = migrated(migrate_v1(&v1(Some("Headset"), None), &inv));
         assert_eq!(out["preferred_mic_device"], Value::Null);
         assert_eq!(out["unresolved_mic_device"], "Headset");
@@ -1202,7 +1225,8 @@ mod tests {
             BackupResult::Written
         );
         let content: Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join(V1_BACKUP_FILE)).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(dir.path().join(V1_BACKUP_FILE)).unwrap())
+                .unwrap();
         assert_eq!(content, json!({ "preferences": first }));
 
         let second = v1(Some("Changed"), None);
@@ -1211,7 +1235,8 @@ mod tests {
             BackupResult::AlreadyPresent
         );
         let content: Value =
-            serde_json::from_slice(&std::fs::read(dir.path().join(V1_BACKUP_FILE)).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(dir.path().join(V1_BACKUP_FILE)).unwrap())
+                .unwrap();
         assert_eq!(content["preferences"]["preferred_mic_device"], "Original");
         assert!(!dir.path().join(format!("{}.tmp", V1_BACKUP_FILE)).exists());
     }

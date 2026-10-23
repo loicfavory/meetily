@@ -351,7 +351,7 @@ async fn get_audio_inventory() -> Result<audio::AudioInventory, String> {
 }
 
 #[tauri::command]
-async fn trigger_microphone_permission()-> Result<bool, String> {
+async fn trigger_microphone_permission() -> Result<bool, String> {
     trigger_audio_permission()
         .map_err(|e| format!("Failed to trigger microphone permission: {}", e))
 }
