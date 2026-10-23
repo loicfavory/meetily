@@ -64,6 +64,34 @@ pub struct AudioDevice {
     pub is_default: bool,
 }
 
+/// How complete one role's device list is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InventoryStatus {
+    /// The list is authoritative: a device missing from it is absent.
+    Complete,
+    /// A fallback list was used: membership of an ID is unknown.
+    Degraded,
+    /// Enumeration failed: nothing is known.
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RoleInventory {
+    pub status: InventoryStatus,
+    pub error: Option<String>,
+}
+
+impl RoleInventory {
+    pub fn complete() -> Self {
+        Self { status: InventoryStatus::Complete, error: None }
+    }
+
+    pub fn with_error(status: InventoryStatus, error: String) -> Self {
+        Self { status, error: Some(error) }
+    }
+}
+
 impl PartialEq for AudioDevice {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name && self.device_type == other.device_type

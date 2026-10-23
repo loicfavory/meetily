@@ -8,7 +8,89 @@ use crate::audio::capture::{
     default_pulse_sink_name, default_pulse_source_name, list_pulse_sinks, list_pulse_sources,
     PulseSink, PulseSource,
 };
-use crate::audio::devices::configuration::{AudioDevice, DeviceType};
+use crate::audio::devices::configuration::{
+    AudioDevice, DeviceType, InventoryStatus, RoleInventory,
+};
+use crate::audio::recording_preferences::{Candidate, MigrationInventory, RoleCandidates};
+
+/// Per-role completeness of the last enumeration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinuxInventoryStatus {
+    pub microphone: RoleInventory,
+    pub system: RoleInventory,
+}
+
+/// Maps the outcome of the two Pulse enumerations to per-role statuses. A
+/// failed source listing is `Degraded` rather than `Failed` because the ALSA
+/// fallback still yields a list, but one that cannot prove a Pulse ID absent.
+pub(crate) fn inventory_status(
+    sources: Result<(), String>,
+    sinks: Result<(), String>,
+) -> LinuxInventoryStatus {
+    let role = |result: Result<(), String>, on_error: InventoryStatus| match result {
+        Ok(()) => RoleInventory::complete(),
+        Err(error) => RoleInventory::with_error(on_error, error),
+    };
+    LinuxInventoryStatus {
+        microphone: role(sources, InventoryStatus::Degraded),
+        system: role(sinks, InventoryStatus::Failed),
+    }
+}
+
+/// Raw Pulse descriptions per role, as needed to migrate legacy preferences.
+/// Goes through the existing enumerator functions; a failing call makes that
+/// role `Unknown`.
+pub(crate) fn migration_inventory() -> MigrationInventory {
+    let microphone = match list_pulse_sources() {
+        Ok(sources) => {
+            let entries: Vec<(&str, &str)> = sources
+                .iter()
+                .map(|s| (s.source_name.as_str(), s.description.as_str()))
+                .collect();
+            let labels = role_labels(&entries, GENERIC_INPUT_LABEL);
+            RoleCandidates::Known(
+                sources
+                    .iter()
+                    .zip(labels)
+                    .map(|(s, label)| Candidate {
+                        id: s.source_name.clone(),
+                        description: s.description.clone(),
+                        label,
+                    })
+                    .collect(),
+            )
+        }
+        Err(e) => {
+            warn!("migration_inventory: failed to list sources: {}", e);
+            RoleCandidates::Unknown
+        }
+    };
+    let system = match list_pulse_sinks() {
+        Ok(sinks) => {
+            let entries: Vec<(&str, &str)> = sinks
+                .iter()
+                .map(|s| (s.name.as_str(), s.description.as_str()))
+                .collect();
+            let labels = role_labels(&entries, GENERIC_OUTPUT_LABEL);
+            RoleCandidates::Known(
+                sinks
+                    .iter()
+                    .zip(labels)
+                    .map(|(s, label)| Candidate {
+                        id: s.name.clone(),
+                        description: s.description.clone(),
+                        label,
+                    })
+                    .collect(),
+            )
+        }
+        Err(e) => {
+            warn!("migration_inventory: failed to list sinks: {}", e);
+            RoleCandidates::Unknown
+        }
+    };
+    MigrationInventory { microphone, system }
+}
 
 /// Global lock serializing every interaction with alsa-lib on Linux.
 ///
@@ -148,7 +230,16 @@ fn pulse_sink_devices(sinks: &[PulseSink], default_name: Option<&str>) -> Vec<Au
 ///
 /// See audio/capture/pulse_linux.rs for the actual capture implementation.
 pub fn configure_linux_audio(host: &cpal::Host) -> Result<Vec<AudioDevice>> {
+    configure_linux_audio_with_status(host).map(|(devices, _)| devices)
+}
+
+/// Same as [`configure_linux_audio`], plus how complete each role's list is.
+pub fn configure_linux_audio_with_status(
+    host: &cpal::Host,
+) -> Result<(Vec<AudioDevice>, LinuxInventoryStatus)> {
     let mut devices = Vec::new();
+    let mut sources_result: Result<(), String> = Ok(());
+    let mut sinks_result: Result<(), String> = Ok(());
 
     // ------------------------------------------------------------------
     // Microphones — nominal path: real PulseAudio/PipeWire input sources.
@@ -170,6 +261,7 @@ pub fn configure_linux_audio(host: &cpal::Host) -> Result<Vec<AudioDevice>> {
                 "🎙️ configure_linux_audio: failed to list PulseAudio/PipeWire sources ({}); falling back to filtered ALSA endpoints",
                 e
             );
+            sources_result = Err(e.to_string());
 
             // Serialize every alsa-lib call: see ALSA_GLOBAL_LOCK doc comment above.
             let input_devices: Vec<_> = {
@@ -211,11 +303,12 @@ pub fn configure_linux_audio(host: &cpal::Host) -> Result<Vec<AudioDevice>> {
         }
         Err(e) => {
             warn!("Failed to list PulseAudio/PipeWire sinks for System Audio: {}", e);
+            sinks_result = Err(e.to_string());
         }
     }
 
     remember_labels(&devices);
-    Ok(devices)
+    Ok((devices, inventory_status(sources_result, sinks_result)))
 }
 
 #[cfg(test)]
@@ -235,6 +328,24 @@ mod tests {
             description: description.to_string(),
             monitor_source_name: format!("{}.monitor", name),
         }
+    }
+
+    #[test]
+    fn inventory_status_maps_pulse_results_to_role_statuses() {
+        let both_ok = inventory_status(Ok(()), Ok(()));
+        assert_eq!(both_ok.microphone.status, InventoryStatus::Complete);
+        assert_eq!(both_ok.system.status, InventoryStatus::Complete);
+        assert!(both_ok.microphone.error.is_none());
+
+        let sources_err = inventory_status(Err("no server".into()), Ok(()));
+        assert_eq!(sources_err.microphone.status, InventoryStatus::Degraded);
+        assert_eq!(sources_err.microphone.error.as_deref(), Some("no server"));
+        assert_eq!(sources_err.system.status, InventoryStatus::Complete);
+
+        let sinks_err = inventory_status(Ok(()), Err("boom".into()));
+        assert_eq!(sinks_err.microphone.status, InventoryStatus::Complete);
+        assert_eq!(sinks_err.system.status, InventoryStatus::Failed);
+        assert_eq!(sinks_err.system.error.as_deref(), Some("boom"));
     }
 
     #[test]

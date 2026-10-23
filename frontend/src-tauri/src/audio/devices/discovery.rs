@@ -2,33 +2,70 @@ use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use log::{error, info};
 
-use super::configuration::AudioDevice;
+use super::configuration::{AudioDevice, InventoryStatus, RoleInventory};
 use super::platform;
+
+/// Devices plus how complete each role's list is, so callers can tell a
+/// confirmed absence from an unknown one.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AudioInventory {
+    pub devices: Vec<AudioDevice>,
+    pub microphone: RoleInventory,
+    pub system: RoleInventory,
+}
 
 /// List all available audio devices on the system
 pub async fn list_audio_devices() -> Result<Vec<AudioDevice>> {
+    enumerate_inventory().await.map(|inventory| inventory.devices)
+}
+
+/// Enumerate devices with per-role completeness. A failed enumeration is
+/// reported as `Failed` for both roles instead of an error.
+pub async fn list_audio_inventory() -> AudioInventory {
+    match enumerate_inventory().await {
+        Ok(inventory) => inventory,
+        Err(e) => {
+            let message = e.to_string();
+            AudioInventory {
+                devices: Vec::new(),
+                microphone: RoleInventory::with_error(InventoryStatus::Failed, message.clone()),
+                system: RoleInventory::with_error(InventoryStatus::Failed, message),
+            }
+        }
+    }
+}
+
+async fn enumerate_inventory() -> Result<AudioInventory> {
     info!("🎙️ list_audio_devices: start");
     let host = cpal::default_host();
 
     // Platform-specific device enumeration
     #[allow(unused_mut)]
-    let mut devices = {
+    let (mut devices, microphone, system) = {
         #[cfg(target_os = "windows")]
         {
-            platform::configure_windows_audio(&host)?
+            (
+                platform::configure_windows_audio(&host)?,
+                RoleInventory::complete(),
+                RoleInventory::complete(),
+            )
         }
 
         #[cfg(target_os = "linux")]
         {
             info!("🎙️ list_audio_devices: calling configure_linux_audio");
-            let result = platform::configure_linux_audio(&host)?;
+            let (result, status) = platform::configure_linux_audio_with_status(&host)?;
             info!("🎙️ list_audio_devices: configure_linux_audio returned {} device(s)", result.len());
-            result
+            (result, status.microphone, status.system)
         }
 
         #[cfg(target_os = "macos")]
         {
-            platform::configure_macos_audio(&host)?
+            (
+                platform::configure_macos_audio(&host)?,
+                RoleInventory::complete(),
+                RoleInventory::complete(),
+            )
         }
     };
     info!("🎙️ list_audio_devices: platform enumeration done, {} device(s) so far", devices.len());
@@ -55,7 +92,7 @@ pub async fn list_audio_devices() -> Result<Vec<AudioDevice>> {
         }
     }
 
-    Ok(devices)
+    Ok(AudioInventory { devices, microphone, system })
 }
 
 /// Trigger audio permission request on platforms that require it

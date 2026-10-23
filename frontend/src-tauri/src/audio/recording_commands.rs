@@ -312,7 +312,8 @@ pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String
     start_recording_with_meeting_name(app, None).await
 }
 
-/// Start recording with default devices and optional meeting name
+/// Start recording with default devices and optional meeting name.
+/// Unlike the Tauri commands, this reads the saved device preferences.
 pub async fn start_recording_with_meeting_name<R: Runtime>(
     app: AppHandle<R>,
     meeting_name: Option<String>,
