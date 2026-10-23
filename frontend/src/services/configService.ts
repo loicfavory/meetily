@@ -7,6 +7,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
+import type { DevicePreferenceFields } from '@/lib/audioDevices';
 
 export interface ModelConfig {
   provider: 'ollama' | 'groq' | 'claude' | 'openrouter' | 'openai' | 'builtin-ai' | 'custom-openai';
@@ -36,9 +37,12 @@ export interface CustomOpenAIConfig {
   topP: number | null;
 }
 
-export interface RecordingPreferences {
+export interface RecordingPreferences extends DevicePreferenceFields {
+  schema_version?: number;
   preferred_mic_device: string | null;
   preferred_system_device: string | null;
+  /** True when a v1 -> v2 migration could not run yet and will be retried. */
+  migration_pending?: boolean;
 }
 
 /**

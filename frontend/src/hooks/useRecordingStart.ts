@@ -13,12 +13,30 @@ import {
   type ModelWithStatus,
 } from '@/lib/transcription-model-readiness';
 import { toast } from 'sonner';
+import type { SelectedDevices } from '@/lib/audioDevices';
 
 const TRANSCRIPTION_RUNTIME_START_ERROR_CODE = 'TRANSCRIPTION_RUNTIME_INITIALIZATION_FAILED';
 const TRANSCRIPTION_RUNTIME_USER_MESSAGE = 'Speech recognition could not initialize. Restart Meetily. If the problem continues, repair or reinstall the app.';
 
 const isTranscriptionRuntimeStartError = (error: unknown) =>
   String(error) === TRANSCRIPTION_RUNTIME_START_ERROR_CODE;
+
+/**
+ * Warns once, before start, that a legacy device choice could not be matched:
+ * the backend then records with the system default for that role. The legacy
+ * text is never sent as a device ID.
+ */
+function warnIfDevicesUnresolved(devices: SelectedDevices | undefined): void {
+  const roles: string[] = [];
+  if (devices?.micUnresolved) roles.push('microphone');
+  if (devices?.systemUnresolved) roles.push('system audio');
+  if (roles.length === 0) return;
+  toast.warning('Saved audio device not recognized', {
+    id: 'unresolved-audio-devices',
+    description: `Recording will use the default ${roles.join(' and ')} device. Select it again in the settings to keep your choice.`,
+    duration: 8000,
+  });
+}
 
 interface UseRecordingStartReturn {
   handleRecordingStart: () => Promise<void>;
@@ -157,6 +175,7 @@ export function useRecordingStart(
 
       // Start the actual backend recording
       console.log('Starting backend recording with meeting:', randomTitle);
+      warnIfDevicesUnresolved(selectedDevices);
       await recordingService.startRecordingWithDevices(
         selectedDevices?.micDevice || null,
         selectedDevices?.systemDevice || null,
@@ -249,6 +268,7 @@ export function useRecordingStart(
             setStatus(RecordingStatus.STARTING, 'Initializing recording...');
 
             console.log('Auto-starting backend recording with meeting:', generatedMeetingTitle);
+            warnIfDevicesUnresolved(selectedDevices);
             const result = await recordingService.startRecordingWithDevices(
               selectedDevices?.micDevice || null,
               selectedDevices?.systemDevice || null,
@@ -347,6 +367,7 @@ export function useRecordingStart(
         setStatus(RecordingStatus.STARTING, 'Initializing recording...');
 
         console.log('Starting backend recording with meeting:', generatedMeetingTitle);
+        warnIfDevicesUnresolved(selectedDevices);
         const result = await recordingService.startRecordingWithDevices(
           selectedDevices?.micDevice || null,
           selectedDevices?.systemDevice || null,

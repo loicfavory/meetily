@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { RefreshCw, Mic, Speaker } from 'lucide-react';
@@ -9,12 +9,17 @@ import { Label } from '@/components/ui/label';
 import Analytics from '@/lib/analytics';
 import {
   AudioDevice,
+  AudioInventory,
+  DeviceRole,
+  RoleInventory,
   SelectedDevices,
+  SelectionStatus,
+  UNRESOLVED_OPTION_VALUE,
   decodeDeviceOption,
   deviceLabel,
   encodeDeviceOption,
-  fetchAudioDevices,
-  isDeviceAvailable,
+  fetchAudioInventory,
+  selectionStatus,
 } from '@/lib/audioDevices';
 
 export type { AudioDevice, SelectedDevices };
@@ -34,12 +39,71 @@ export interface AudioLevelUpdate {
 
 interface DeviceSelectionProps {
   selectedDevices: SelectedDevices;
-  onDeviceChange: (devices: SelectedDevices) => void;
+  onDeviceChange: (devices: SelectedDevices, changedRole: DeviceRole) => void;
   disabled?: boolean;
 }
 
+function failedInventory(previous: AudioInventory | null, message: string): AudioInventory {
+  const failed: RoleInventory = { status: 'failed', error: message };
+  return { devices: previous?.devices ?? [], microphone: failed, system: failed };
+}
+
+/**
+ * Option shown for a selection that has no entry in the enumerated list, so
+ * the Select always has an item matching its value. Null when the list
+ * already carries the selection (or the selection is the default).
+ */
+function placeholderOption(
+  status: SelectionStatus,
+  listed: readonly AudioDevice[],
+): { value: string; text: string } | null {
+  switch (status.kind) {
+    case 'unknown':
+    case 'absent':
+      if (listed.some((d) => d.name === status.id)) return null;
+      return {
+        value: encodeDeviceOption(status.id),
+        text: `${status.label} (${status.kind === 'absent' ? 'not connected' : 'unavailable'})`,
+      };
+    case 'unresolved':
+      return { value: UNRESOLVED_OPTION_VALUE, text: `${status.legacy} (select again)` };
+    default:
+      return null;
+  }
+}
+
+function selectValue(status: SelectionStatus): string {
+  switch (status.kind) {
+    case 'default':
+      return encodeDeviceOption(null);
+    case 'unresolved':
+      return UNRESOLVED_OPTION_VALUE;
+    default:
+      return encodeDeviceOption(status.id);
+  }
+}
+
+function RoleNotice({ status, inventory }: { status: SelectionStatus; inventory: RoleInventory | null }) {
+  let message: string | null = null;
+  if (status.kind === 'absent') {
+    message = 'The selected device is not connected. Your choice is kept and will be used as soon as it reappears; otherwise the startup fallback applies.';
+  } else if (status.kind === 'unresolved') {
+    message = 'Your previous choice could not be matched to a device. Select a device again, or choose Default.';
+  } else if (status.kind === 'unknown' && status.reason !== 'loading') {
+    message = status.error
+      ? `Device availability unknown: ${status.error}. Your choice is kept.`
+      : 'Device availability unknown. Your choice is kept.';
+  } else if (inventory && inventory.status !== 'complete') {
+    message = inventory.error
+      ? `Device list may be incomplete: ${inventory.error}.`
+      : 'Device list may be incomplete.';
+  }
+  if (!message) return null;
+  return <p className="text-xs text-amber-700">{message}</p>;
+}
+
 export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = false }: DeviceSelectionProps) {
-  const [devices, setDevices] = useState<AudioDevice[]>([]);
+  const [inventory, setInventory] = useState<AudioInventory | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
@@ -47,20 +111,27 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
   const [isMonitoring, setIsMonitoring] = useState(false);
   const [showLevels, setShowLevels] = useState(false);
 
+  const devices = inventory?.devices ?? [];
+
   // Filter devices by type
   const inputDevices = devices.filter(device => device.device_type === 'Input');
   const outputDevices = devices.filter(device => device.device_type === 'Output');
 
-  // Fetch available audio devices
+  const micStatus = selectionStatus('microphone', selectedDevices, inventory);
+  const systemStatus = selectionStatus('system', selectedDevices, inventory);
+
+  // Fetch available audio devices. A failed fetch keeps the previous list and
+  // marks both roles as failed: the saved selection is never touched here.
   const fetchDevices = async () => {
     try {
       setError(null);
-      const result = await fetchAudioDevices();
-      setDevices(result);
-      console.log('Fetched audio devices:', result);
+      const result = await fetchAudioInventory();
+      setInventory(result);
+      console.log('Fetched audio inventory:', result);
     } catch (err) {
-      console.error('Failed to fetch audio devices:', err);
-      setError('Failed to load audio devices. Please check your system audio settings.');
+      console.error('Failed to fetch audio inventory:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      setInventory((previous) => failedInventory(previous, message));
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -71,59 +142,6 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
   useEffect(() => {
     fetchDevices();
   }, []);
-
-  // Auto-select the default when a previously-selected device is no longer
-  // available (e.g. AirPods that have since disconnected). Without this the
-  // dropdown keeps showing a device that's gone — Radix Select renders an
-  // empty/stale trigger for a value not among its options — and start would
-  // send a name the backend can't open. Matches Pro's DeviceSelection prune.
-  //
-  // Selections hold exact device IDs (AudioDevice.name), compared as-is. The
-  // display label is never part of the comparison, so a label change cannot
-  // look like a disconnection.
-  //
-  // ponytail: enumeration-driven prune only (fires on mount + manual refresh).
-  // We deliberately do NOT mutate the selection from the mic-device-switched
-  // event — that stays toast-only; reopening Settings after a meeting refetches
-  // and prunes. onDeviceChange is held in a ref so the effect isn't re-run by
-  // the parent passing a fresh (non-memoized) handler each render.
-  const onDeviceChangeRef = useRef(onDeviceChange);
-  useEffect(() => { onDeviceChangeRef.current = onDeviceChange; }, [onDeviceChange]);
-
-  useEffect(() => {
-    // Skip while loading (list not ready) or disabled (selector locked during
-    // recording — never reset the device a live recording is using).
-    if (loading || disabled) return;
-
-    const inputs = devices.filter(d => d.device_type === 'Input');
-    const outputs = devices.filter(d => d.device_type === 'Output');
-
-    let next = selectedDevices;
-    // Guard on a non-empty list per direction so a transient phantom-empty
-    // enumeration doesn't wipe a valid selection.
-    if (
-      selectedDevices.micDevice &&
-      inputs.length > 0 &&
-      !isDeviceAvailable(inputs, 'Input', selectedDevices.micDevice)
-    ) {
-      console.warn(`[DeviceSelection] Selected mic '${selectedDevices.micDevice}' not available — resetting to default`);
-      next = { ...next, micDevice: null };
-    }
-    if (
-      selectedDevices.systemDevice &&
-      outputs.length > 0 &&
-      !isDeviceAvailable(outputs, 'Output', selectedDevices.systemDevice)
-    ) {
-      console.warn(`[DeviceSelection] Selected system audio '${selectedDevices.systemDevice}' not available — resetting to default`);
-      next = { ...next, systemDevice: null };
-    }
-
-    // Only propagate if something actually changed. Resetting to null makes the
-    // next run's absent-check falsy, so there's no loop.
-    if (next !== selectedDevices) {
-      onDeviceChangeRef.current(next);
-    }
-  }, [devices, loading, disabled, selectedDevices]);
 
   // Set up audio level event listener
   useEffect(() => {
@@ -198,11 +216,13 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
   const handleMicDeviceChange = (optionValue: string) => {
     const deviceName = decodeDeviceOption(optionValue);
     if (deviceName === undefined) return;
-    const newDevices = {
+    const newDevices: SelectedDevices = {
       ...selectedDevices,
-      micDevice: deviceName
+      micDevice: deviceName,
+      micLabel: deviceName === null ? null : labelFor(deviceName),
+      micUnresolved: null,
     };
-    onDeviceChange(newDevices);
+    onDeviceChange(newDevices, 'microphone');
 
     // Track device selection analytics with enhanced metadata
     const metadata = getDeviceMetadata(deviceName === null ? null : labelFor(deviceName));
@@ -217,11 +237,13 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
   const handleSystemDeviceChange = (optionValue: string) => {
     const deviceName = decodeDeviceOption(optionValue);
     if (deviceName === undefined) return;
-    const newDevices = {
+    const newDevices: SelectedDevices = {
       ...selectedDevices,
-      systemDevice: deviceName
+      systemDevice: deviceName,
+      systemLabel: deviceName === null ? null : labelFor(deviceName),
+      systemUnresolved: null,
     };
-    onDeviceChange(newDevices);
+    onDeviceChange(newDevices, 'system');
 
     // Track device selection analytics with enhanced metadata
     const metadata = getDeviceMetadata(deviceName === null ? null : labelFor(deviceName));
@@ -329,7 +351,7 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
             </Label>
           </div>
           <Select
-            value={encodeDeviceOption(selectedDevices.micDevice)}
+            value={selectValue(micStatus)}
             onValueChange={handleMicDeviceChange}
             disabled={disabled}
           >
@@ -337,6 +359,10 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
               <SelectValue placeholder="Select Microphone" />
             </SelectTrigger>
             <SelectContent>
+              {(() => {
+                const extra = placeholderOption(micStatus, inputDevices);
+                return extra && <SelectItem value={extra.value} disabled>{extra.text}</SelectItem>;
+              })()}
               <SelectItem value={encodeDeviceOption(null)}>Default Microphone</SelectItem>
               {inputDevices.map((device) => (
                 <SelectItem
@@ -351,6 +377,7 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
           {inputDevices.length === 0 && (
             <p className="text-xs text-gray-500">No microphone devices found</p>
           )}
+          <RoleNotice status={micStatus} inventory={inventory?.microphone ?? null} />
 
           {/* Audio Level Meters for Input Devices */}
           {showLevels && inputDevices.length > 0 && (
@@ -398,7 +425,7 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
           </div>
 
           <Select
-            value={encodeDeviceOption(selectedDevices.systemDevice)}
+            value={selectValue(systemStatus)}
             onValueChange={handleSystemDeviceChange}
             disabled={disabled}
           >
@@ -406,6 +433,10 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
               <SelectValue placeholder="Select System Audio" />
             </SelectTrigger>
             <SelectContent>
+              {(() => {
+                const extra = placeholderOption(systemStatus, outputDevices);
+                return extra && <SelectItem value={extra.value} disabled>{extra.text}</SelectItem>;
+              })()}
               <SelectItem value={encodeDeviceOption(null)}>Default System Audio</SelectItem>
               {outputDevices.map((device) => (
                 <SelectItem
@@ -421,6 +452,7 @@ export function DeviceSelection({ selectedDevices, onDeviceChange, disabled = fa
           {outputDevices.length === 0 && (
             <p className="text-xs text-gray-500">No system audio devices found</p>
           )}
+          <RoleNotice status={systemStatus} inventory={inventory?.system ?? null} />
 
           {/* Backend Selection - available on all platforms */}
           {!disabled && (

@@ -3,6 +3,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, ReactNode, useRef } from 'react';
 import { TranscriptModelProps } from '@/components/TranscriptSettings';
 import { SelectedDevices } from '@/components/DeviceSelection';
+import { selectedDevicesFromPreferences } from '@/lib/audioDevices';
 import { configService, ModelConfig } from '@/services/configService';
 import { invoke } from '@tauri-apps/api/core';
 import Analytics from '@/lib/analytics';
@@ -352,11 +353,8 @@ export function ConfigProvider({ children }: { children: ReactNode }) {
     const loadDevicePreferences = async () => {
       try {
         const prefs = await configService.getRecordingPreferences();
-        if (prefs && (prefs.preferred_mic_device || prefs.preferred_system_device)) {
-          setSelectedDevices({
-            micDevice: prefs.preferred_mic_device,
-            systemDevice: prefs.preferred_system_device
-          });
+        if (prefs) {
+          setSelectedDevices(selectedDevicesFromPreferences(prefs));
           console.log('Loaded device preferences:', prefs);
         }
       } catch (error) {

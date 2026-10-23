@@ -184,7 +184,7 @@ export function SettingsModals({
 
           <DeviceSelection
             selectedDevices={selectedDevices}
-            onDeviceChange={setSelectedDevices}
+            onDeviceChange={(devices) => setSelectedDevices(devices)}
             disabled={isRecording}
           />
 

@@ -4,12 +4,19 @@ import { FolderOpen } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { DeviceSelection, SelectedDevices } from '@/components/DeviceSelection';
 import Analytics from '@/lib/analytics';
-import { cachedDeviceLabel } from '@/lib/audioDevices';
+import {
+  DevicePreferenceFields,
+  DeviceRole,
+  cachedDeviceLabel,
+  selectedDevicesFromPreferences,
+} from '@/lib/audioDevices';
 import { toast } from 'sonner';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { useConfig } from '@/contexts/ConfigContext';
 
-export interface RecordingPreferences {
+export interface RecordingPreferences extends DevicePreferenceFields {
+  schema_version?: number;
+  migration_pending?: boolean;
   save_folder: string;
   auto_save: boolean;
   file_format: string;
@@ -84,26 +91,43 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     });
   };
 
-  const handleDeviceChange = async (devices: SelectedDevices) => {
-    const newPreferences = {
-      ...preferences,
-      preferred_mic_device: devices.micDevice,
-      preferred_system_device: devices.systemDevice
-    };
-    setPreferences(newPreferences);
-    // Sync the in-memory selection ConfigContext exposes to the start path.
-    // Without this, the picker only writes to disk (loaded into context once at
-    // app mount), so a newly-chosen mic isn't honored until the next launch —
-    // start keeps sending the stale launch-time device.
-    setSelectedDevices(devices);
-    await savePreferences(newPreferences);
+  const handleDeviceChange = async (devices: SelectedDevices, changedRole: DeviceRole) => {
+    const isMic = changedRole === 'microphone';
+    const deviceId = isMic ? devices.micDevice : devices.systemDevice;
+    const label = deviceId === null ? null : (isMic ? devices.micLabel : devices.systemLabel) ?? null;
 
-    // Track default device preference changes
-    // Note: Individual device selection analytics are tracked in DeviceSelection component
-    await Analytics.track('default_devices_changed', {
-      has_preferred_microphone: (!!devices.micDevice).toString(),
-      has_preferred_system_audio: (!!devices.systemDevice).toString()
-    });
+    setSaving(true);
+    try {
+      const updated = await invoke<RecordingPreferences>('set_preferred_audio_device', {
+        role: changedRole,
+        deviceId,
+        label,
+      });
+      setPreferences(updated);
+      // Sync the in-memory selection ConfigContext exposes to the start path
+      // from what the backend actually stored.
+      const selected = selectedDevicesFromPreferences(updated);
+      setSelectedDevices(selected);
+
+      const describe = (id: string | null, snapshot: string | null | undefined) =>
+        id ? (snapshot ?? cachedDeviceLabel(id)) : 'Default';
+      toast.success("Device preferences saved", {
+        description: `Microphone: ${describe(selected.micDevice, selected.micLabel)}, System Audio: ${describe(selected.systemDevice, selected.systemLabel)}`
+      });
+
+      // Individual device selection analytics are tracked in DeviceSelection component
+      await Analytics.track('default_devices_changed', {
+        has_preferred_microphone: (!!selected.micDevice).toString(),
+        has_preferred_system_audio: (!!selected.systemDevice).toString()
+      });
+    } catch (error) {
+      console.error('Failed to save device preference:', error);
+      toast.error("Failed to save device preferences", {
+        description: error instanceof Error ? error.message : String(error)
+      });
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleOpenFolder = async () => {
@@ -136,16 +160,10 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
     try {
       await invoke('set_recording_preferences', { preferences: prefs });
       onSave?.(prefs);
-
-      // Show success toast with device details
-      const micDevice = prefs.preferred_mic_device ? cachedDeviceLabel(prefs.preferred_mic_device) : 'Default';
-      const systemDevice = prefs.preferred_system_device ? cachedDeviceLabel(prefs.preferred_system_device) : 'Default';
-      toast.success("Device preferences saved", {
-        description: `Microphone: ${micDevice}, System Audio: ${systemDevice}`
-      });
+      toast.success("Recording preferences saved");
     } catch (error) {
       console.error('Failed to save recording preferences:', error);
-      toast.error("Failed to save device preferences", {
+      toast.error("Failed to save recording preferences", {
         description: error instanceof Error ? error.message : String(error)
       });
     } finally {
@@ -257,10 +275,7 @@ export function RecordingSettings({ onSave }: RecordingSettingsProps) {
 
           <div className="border rounded-lg p-4 bg-gray-50">
             <DeviceSelection
-              selectedDevices={{
-                micDevice: preferences.preferred_mic_device,
-                systemDevice: preferences.preferred_system_device
-              }}
+              selectedDevices={selectedDevicesFromPreferences(preferences)}
               onDeviceChange={handleDeviceChange}
               disabled={saving || isRecording}
             />
